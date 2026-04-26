@@ -1,0 +1,12 @@
+{
+  "name": "sanctions-etl",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node build.js"
+  },
+  "dependencies": {
+    "papaparse": "^5.4.1",
+    "fast-xml-parser": "^4.5.0"
+  }
+}
