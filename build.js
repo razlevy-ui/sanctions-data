@@ -60,49 +60,62 @@ function parseCsv(body) {
 }
 
 function parseXml(body, listId) {
-const parser = new XMLParser({
-  ignoreAttributes: false,
-  parseTagValue: true,
-  processEntities: true,
-  maxEntityCount: 10_000_000,
-  maxTotalExpansions: 10_000_000,
-  maxExpansionDepth: 1_000_000,
-  maxExpandedLength: 100_000_000,
-  maxEntitySize: 10_000_000,
-});  const doc = parser.parse(body);
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    parseTagValue: false,
+    processEntities: true,
+    maxEntityCount: 10_000_000,
+    maxTotalExpansions: 10_000_000,
+    maxExpansionDepth: 1_000_000,
+    maxExpandedLength: 100_000_000,
+    maxEntitySize: 10_000_000,
+  });
+  const doc = parser.parse(body);
 
-  const findArray = (o) => {
-    if (Array.isArray(o)) return o;
-    if (typeof o !== 'object' || !o) return null;
-    for (const k of Object.keys(o)) {
-      const r = findArray(o[k]);
-      if (r && r.length > 0 && typeof r[0] === 'object') return r;
-    }
-    return null;
+  // SpreadsheetML: Workbook → Worksheet → Table → Row[] → Cell[] → Data
+  const ws = doc?.Workbook?.Worksheet;
+  const sheet = Array.isArray(ws) ? ws[0] : ws;
+  let rows = sheet?.Table?.Row;
+  if (!Array.isArray(rows)) rows = rows ? [rows] : [];
+  if (rows.length < 3) return [];
+
+  const cellText = (cell) => {
+    const d = cell?.Data;
+    if (d == null) return '';
+    if (typeof d === 'object') return String(d['#text'] ?? '');
+    return String(d);
+  };
+  const rowCells = (row) => {
+    const c = row?.Cell;
+    const arr = Array.isArray(c) ? c : (c ? [c] : []);
+    return arr.map(cellText);
   };
 
-  const items = findArray(doc) || [];
-  const pick = (o, keys) => { for (const k of keys) if (o?.[k]) return String(o[k]); return ''; };
+  // Row 1 = Hebrew headers, Row 2 = English headers, Row 3+ = data
+  const headers = rowCells(rows[1]).map(h => (h || '').trim().toLowerCase());
+  const findCol = (...needles) => headers.findIndex(h => needles.every(n => h.includes(n)));
 
-  return items.map(item => {
-    const name = pick(item, ['NameInEnglish','Name','FullName','EntityName']);
+  const nameCol = [findCol('name','english'), findCol('name')].find(i => i >= 0) ?? -1;
+  if (nameCol < 0) return [];
+  const idCol = findCol('id');
+  const nationCol = [findCol('national'), findCol('residency')].find(i => i >= 0) ?? -1;
+  const designationCol = findCol('designation');
+  const refCol = [findCol('seq'), findCol('serial')].find(i => i >= 0) ?? -1;
+
+  return rows.slice(2).map(r => {
+    const cells = rowCells(r);
+    const name = (cells[nameCol] || '').trim();
     if (!name) return null;
-    const aliases = [];
-    for (const k of ['Alias','AlsoKnownAs','AKA','NameVariation']) {
-      const v = item?.[k];
-      if (Array.isArray(v)) v.forEach(x => aliases.push(String(x)));
-      else if (v) aliases.push(String(v));
-    }
     return {
       name,
       name_normalized: normalize(name),
-      aliases,
-      aliases_normalized: aliases.map(normalize),
+      aliases: [],
+      aliases_normalized: [],
       type: listId === 'il_individuals' ? 'Individual' : 'Entity',
-      country: pick(item, ['Country','Nationality']),
+      country: nationCol >= 0 ? (cells[nationCol] || '') : '',
       program: `NBCTF ${listId}`,
-      ref: pick(item, ['Id','Reference','SerialNumber']),
-      reason: pick(item, ['Reason','Designation','Description'])
+      ref: refCol >= 0 ? (cells[refCol] || '') : (idCol >= 0 ? (cells[idCol] || '') : ''),
+      reason: designationCol >= 0 ? (cells[designationCol] || '') : ''
     };
   }).filter(Boolean);
 }
