@@ -12,7 +12,7 @@ const SOURCES = [
   { id:'uk', display:'UK Sanctions (FCDO)', format:'csv',
     url:'https://data.opensanctions.org/datasets/latest/gb_fcdo_sanctions/targets.simple.csv' },
   { id:'ch', display:'Switzerland SECO', format:'csv',
-    url:'https://data.opensanctions.org/datasets/latest/ch_seco/targets.simple.csv' },
+url:'https://data.opensanctions.org/datasets/latest/ch_seco_sanctions/targets.simple.csv' },
   { id:'il_individuals', display:'Israel NBCTF — Individuals', format:'xml',
     url:'https://nbctf.mod.gov.il/he/Announcements/Documents/NBCTF%20Israel%20designation%20Individuals_XML.xml' },
   { id:'il_orgs', display:'Israel NBCTF — Organizations', format:'xml',
@@ -60,8 +60,16 @@ function parseCsv(body) {
 }
 
 function parseXml(body, listId) {
-  const parser = new XMLParser({ ignoreAttributes:false, parseTagValue:true });
-  const doc = parser.parse(body);
+const parser = new XMLParser({
+  ignoreAttributes: false,
+  parseTagValue: true,
+  processEntities: true,
+  maxEntityCount: 10_000_000,
+  maxTotalExpansions: 10_000_000,
+  maxExpansionDepth: 1_000_000,
+  maxExpandedLength: 100_000_000,
+  maxEntitySize: 10_000_000,
+});  const doc = parser.parse(body);
 
   const findArray = (o) => {
     if (Array.isArray(o)) return o;
