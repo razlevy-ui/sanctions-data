@@ -21,7 +21,10 @@ const SOURCES = [
     url:'https://nbctf.mod.gov.il/he/PropertyPerceptions/Documents/NBCTF_Seizure_List-XML.xml' }
 ];
 
-const PARTICLES = new Set(['al','abu','ibn','bin','el','van','de','von','ben','der','la','le','du']);
+const PARTICLES = new Set([
+  'al','abu','ibn','bin','el','van','de','von','ben',
+  'bint','bt','bte','der','den','la','le','du','das','los','las',
+]);
 
 function normalize(s) {
   if (!s) return '';
@@ -220,7 +223,7 @@ for (const src of SOURCES) {
     const body = await fetchUrl(src.url);
     const raw = src.format === 'csv' ? parseCsv(body) : parseXml(body, src.id);
     if (!raw.length) throw new Error('Parser produced 0 records');
-    const records = dedup(raw);
+    const records = dedup(raw).map(r => ({ list_id: src.id, ...r }));
     const filtered_count = raw.length - records.length;
     out.lists.push({
       id: src.id, display_name: src.display, source_url: src.url,
