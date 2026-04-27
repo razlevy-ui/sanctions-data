@@ -12,7 +12,7 @@ const SOURCES = [
   { id:'uk', display:'UK Sanctions (FCDO)', format:'csv',
     url:'https://data.opensanctions.org/datasets/latest/gb_fcdo_sanctions/targets.simple.csv' },
   { id:'ch', display:'Switzerland SECO', format:'csv',
-url:'https://data.opensanctions.org/datasets/latest/ch_seco_sanctions/targets.simple.csv' },
+    url:'https://data.opensanctions.org/datasets/latest/ch_seco_sanctions/targets.simple.csv' },
   { id:'il_individuals', display:'Israel NBCTF — Individuals', format:'xml',
     url:'https://nbctf.mod.gov.il/he/Announcements/Documents/NBCTF%20Israel%20designation%20Individuals_XML.xml' },
   { id:'il_orgs', display:'Israel NBCTF — Organizations', format:'xml',
@@ -25,9 +25,37 @@ const PARTICLES = new Set(['al','abu','ibn','bin','el','van','de','von','ben','d
 
 function normalize(s) {
   if (!s) return '';
-  return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+  return s.normalize('NFD').replace(/[̀-ͯ]/g,'')
     .toLowerCase().replace(/[^\p{L}\p{N}\s]/gu,' ')
     .split(/\s+/).filter(w => w && !PARTICLES.has(w)).join(' ').trim();
+}
+
+// Returns true if the string looks like an ISO datetime (from SpreadsheetML date cells)
+function isIsoDatetime(s) {
+  return /^\d{4}-\d{2}-\d{2}T/.test(s);
+}
+
+// Returns true if the string looks like a DD/MM/YYYY date
+function isDmyDate(s) {
+  return /^\d{2}\/\d{2}\/\d{4}$/.test(s);
+}
+
+// Decode numeric HTML entities that fast-xml-parser may leave unresolved (e.g. &#45; → -)
+function decodeNumericEntities(s) {
+  if (!s || !s.includes('&#')) return s;
+  return s.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n)));
+}
+
+// Returns true if the string is a null placeholder (e.g. "--/--/----")
+function isNullPlaceholder(s) {
+  if (!s) return true;
+  const decoded = decodeNumericEntities(s);
+  return /^[-\s\/—–]+$/.test(decoded);
+}
+
+// Returns true if the record has a revoked/cancelled designation (Hebrew: בוטל)
+function isRevoked(s) {
+  return typeof s === 'string' && s.includes('בוטל');
 }
 
 async function fetchUrl(url) {
@@ -51,9 +79,11 @@ function parseCsv(body) {
       aliases,
       aliases_normalized: aliases.map(normalize),
       type: r.schema === 'Person' ? 'Individual' : 'Entity',
-      country: r.countries || '',
+      country: (r.countries || '').replace(/^-$/, ''),
       program: r.sanctions || '',
       ref: r.id || '',
+      designation_date: '',
+      expiry_date: '',
       reason: r.notes || ''
     };
   });
@@ -82,8 +112,8 @@ function parseXml(body, listId) {
   const cellText = (cell) => {
     const d = cell?.Data;
     if (d == null) return '';
-    if (typeof d === 'object') return String(d['#text'] ?? '');
-    return String(d);
+    const raw = typeof d === 'object' ? String(d['#text'] ?? '') : String(d);
+    return decodeNumericEntities(raw);
   };
   const rowCells = (row) => {
     const c = row?.Cell;
@@ -95,53 +125,120 @@ function parseXml(body, listId) {
   const headers = rowCells(rows[1]).map(h => (h || '').trim().toLowerCase());
   const findCol = (...needles) => headers.findIndex(h => needles.every(n => h.includes(n)));
 
-  const nameCol = [findCol('name','english'), findCol('name')].find(i => i >= 0) ?? -1;
+  const nameCol   = [findCol('name','english'), findCol('name')].find(i => i >= 0) ?? -1;
   if (nameCol < 0) return [];
-  const idCol = findCol('id');
-  const nationCol = [findCol('national'), findCol('residency')].find(i => i >= 0) ?? -1;
-  const designationCol = findCol('designation');
-  const refCol = [findCol('seq'), findCol('serial')].find(i => i >= 0) ?? -1;
+
+  const idCol         = findCol('id');
+  const nationCol     = [findCol('national'), findCol('residency'), findCol('citizen')].find(i => i >= 0) ?? -1;
+  const aliasCol      = [findCol('alias'), findCol('aka'), findCol('known')].find(i => i >= 0) ?? -1;
+  const designationCol = findCol('designation');   // usually "Designation Date"
+  const expiryCol     = [findCol('expiry'), findCol('valid until'), findCol('until')].find(i => i >= 0) ?? -1;
+  // seq/serial: correct for individuals/orgs; in il_seizure this column holds the expiry date
+  const refCol        = [findCol('seq'), findCol('serial'), findCol('order','number'), findCol('number')].find(i => i >= 0) ?? -1;
+
+  const today = new Date().toISOString().substring(0, 10);
 
   return rows.slice(2).map(r => {
     const cells = rowCells(r);
+
     const name = (cells[nameCol] || '').trim();
-    if (!name) return null;
+    if (!name || name === '-') return null;
+
+    // Aliases — may or may not exist in each XML
+    const aliasRaw = aliasCol >= 0 ? (cells[aliasCol] || '').trim() : '';
+    const aliases = aliasRaw && aliasRaw !== '-'
+      ? aliasRaw.split(/[;,]/).map(s => s.trim()).filter(Boolean)
+      : [];
+
+    // Country — normalize '-' placeholder to ''
+    const countryRaw = nationCol >= 0 ? (cells[nationCol] || '').trim() : '';
+    const country = countryRaw === '-' ? '' : countryRaw;
+
+    // Designation date — stored in 'designation' column (e.g. "25/03/2026" or ISO)
+    const designationRaw = designationCol >= 0 ? (cells[designationCol] || '').trim() : '';
+    // If the field contains a revocation notice, drop this record entirely
+    if (isRevoked(designationRaw)) return null;
+    const designation_date = (isDmyDate(designationRaw) || isIsoDatetime(designationRaw))
+      ? designationRaw
+      : '';
+    // Null placeholders (--/--/----) become empty string
+    const reason = designation_date || isNullPlaceholder(designationRaw) ? '' : designationRaw;
+
+    // Ref / expiry — the refCol in il_seizure contains expiry datetimes instead of IDs
+    const refRaw = refCol >= 0 ? (cells[refCol] || '').trim() : '';
+    const refIsDate = isIsoDatetime(refRaw);
+
+    // Explicit expiry column takes priority; fall back to refCol if it looks like a date
+    const expiryRaw = expiryCol >= 0
+      ? (cells[expiryCol] || '').trim()
+      : (refIsDate ? refRaw : '');
+    const expiry_date = isIsoDatetime(expiryRaw) ? expiryRaw.substring(0, 10) : '';
+
+    const ref = refIsDate
+      ? (idCol >= 0 ? (cells[idCol] || '').trim() : '')
+      : refRaw;
+
     return {
       name,
       name_normalized: normalize(name),
-      aliases: [],
-      aliases_normalized: [],
+      aliases,
+      aliases_normalized: aliases.map(normalize),
       type: listId === 'il_individuals' ? 'Individual' : 'Entity',
-      country: nationCol >= 0 ? (cells[nationCol] || '') : '',
+      country,
       program: `NBCTF ${listId}`,
-      ref: refCol >= 0 ? (cells[refCol] || '') : (idCol >= 0 ? (cells[idCol] || '') : ''),
-      reason: designationCol >= 0 ? (cells[designationCol] || '') : ''
+      ref,
+      designation_date,
+      expiry_date,
+      reason
     };
-  }).filter(Boolean);
+  }).filter(r => {
+    if (!r) return false;
+    if (!r.name_normalized) return false;
+    // Drop expired seizure/designation orders
+    if (r.expiry_date && r.expiry_date < today) return false;
+    return true;
+  });
 }
 
-const out = { generated_at: new Date().toISOString(), lists: [] };
+// Deduplicate records within a list by (name_normalized, ref)
+function dedup(records) {
+  const seen = new Set();
+  return records.filter(r => {
+    const key = r.name_normalized + '|' + r.ref;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+const today_str = new Date().toISOString().substring(0, 10);
+const out = { generated_at: new Date().toISOString(), build_date: today_str, lists: [] };
 
 for (const src of SOURCES) {
   try {
     console.log(`Fetching ${src.id}...`);
     const body = await fetchUrl(src.url);
-    const records = src.format === 'csv' ? parseCsv(body) : parseXml(body, src.id);
-    if (!records.length) throw new Error('Parser produced 0 records');
+    const raw = src.format === 'csv' ? parseCsv(body) : parseXml(body, src.id);
+    if (!raw.length) throw new Error('Parser produced 0 records');
+    const records = dedup(raw);
+    const filtered_count = raw.length - records.length;
     out.lists.push({
       id: src.id, display_name: src.display, source_url: src.url,
-      records_count: records.length, status: 'ok', records
+      records_count: records.length,
+      filtered_count,
+      status: 'ok',
+      records
     });
-    console.log(`  ${src.id}: ${records.length} records`);
+    console.log(`  ${src.id}: ${records.length} records (${filtered_count} filtered/deduped)`);
   } catch (e) {
     console.error(`  ${src.id}: FAILED — ${e.message}`);
     out.lists.push({
       id: src.id, display_name: src.display, source_url: src.url,
-      records_count: 0, status: 'failed', error: e.message, records: []
+      records_count: 0, filtered_count: 0, status: 'failed', error: e.message, records: []
     });
   }
 }
 
 await fs.writeFile('data.json', JSON.stringify(out));
 const total = out.lists.reduce((a,l)=>a+l.records_count,0);
-console.log(`\nDone. Total records across all lists: ${total}`);
+console.log(`\nDone. Total active records: ${total}`);
